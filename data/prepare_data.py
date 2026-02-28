@@ -4,7 +4,7 @@ import random
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 
 # =========================
@@ -88,48 +88,70 @@ class TeamForm:
         self.seq += result_char
 
     def finalize(self) -> "TeamForm":
-        # keep seq length LAST_N
         self.seq = self.seq[-LAST_N:]
         return self
 
     def extra_stats(self) -> Tuple[int, int, float, float]:
         pts = self.W * 3 + self.D
         gd = self.GF - self.GA
-        avg_gf = round(safe_div(self.GF, LAST_N), 2)
-        avg_ga = round(safe_div(self.GA, LAST_N), 2)
+        avg_gf = round(safe_div(self.GF, LAST_N), 3)
+        avg_ga = round(safe_div(self.GA, LAST_N), 3)
         return pts, gd, avg_gf, avg_ga
 
 
-def form_to_text(prefix: str, f: TeamForm) -> str:
+def last_n_form(history: List[Tuple[str, int, int]]) -> TeamForm:
+    f = TeamForm()
+    for res, gf, ga in history[-LAST_N:]:
+        f.add(res, gf, ga)
+    return f.finalize()
+
+
+def form_to_features(f: TeamForm) -> List[float]:
     pts, gd, avg_gf, avg_ga = f.extra_stats()
-    return (
-        f"{prefix} last{LAST_N}: W{f.W} D{f.D} L{f.L}, "
-        f"GF {f.GF} GA {f.GA}, GD {gd}, PTS {pts}, AvgGF {avg_gf} AvgGA {avg_ga}, seq {f.seq}."
-    )
+    # 9 numeric features
+    return [
+        float(f.W),
+        float(f.D),
+        float(f.L),
+        float(f.GF),
+        float(f.GA),
+        float(gd),
+        float(pts),
+        float(avg_gf),
+        float(avg_ga),
+    ]
 
 
-def build_example_text(
+def build_compact_text(
     league_name: str,
     season: str,
     home_team: str,
     away_team: str,
+    home_elo: float,
+    away_elo: float,
     home_last: TeamForm,
     away_last: TeamForm,
     home_home_last: TeamForm,
     away_away_last: TeamForm,
-    home_elo: float,
-    away_elo: float,
+    hh_fallback: int,
+    aa_fallback: int,
 ) -> str:
-    # Same “style” as before, only richer
-    # Keep it readable and consistent.
+    # Kompaktan "field" format: manje tokena, vise signala
+    # BPE tokenizer ce ovo fino obraditi.
+    hp, hgd, havg_gf, havg_ga = home_last.extra_stats()
+    ap, agd, aavg_gf, aavg_ga = away_last.extra_stats()
+
+    hhp, hhgd, hhavg_gf, hhavg_ga = home_home_last.extra_stats()
+    aap, aagd, aaavg_gf, aaavg_ga = away_away_last.extra_stats()
+
     return (
-        f"League: {league_name}. Season: {season}. "
-        f"Home team: {home_team}. Away team: {away_team}. "
-        f"Home ELO: {round(home_elo, 1)}. Away ELO: {round(away_elo, 1)}. "
-        f"{form_to_text('Home', home_last)} "
-        f"{form_to_text('Away', away_last)} "
-        f"{form_to_text('Home home', home_home_last)} "
-        f"{form_to_text('Away away', away_away_last)}"
+        f"LEAGUE={league_name} SEASON={season} "
+        f"HOME={home_team} AWAY={away_team} "
+        f"HELO={round(home_elo,1)} AELO={round(away_elo,1)} "
+        f"H_W={home_last.W} H_D={home_last.D} H_L={home_last.L} H_GF={home_last.GF} H_GA={home_last.GA} H_GD={hgd} H_PTS={hp} H_AVGGF={havg_gf} H_AVGGA={havg_ga} H_SEQ={home_last.seq} "
+        f"A_W={away_last.W} A_D={away_last.D} A_L={away_last.L} A_GF={away_last.GF} A_GA={away_last.GA} A_GD={agd} A_PTS={ap} A_AVGGF={aavg_gf} A_AVGGA={aavg_ga} A_SEQ={away_last.seq} "
+        f"HH_FALLBACK={hh_fallback} HH_W={home_home_last.W} HH_D={home_home_last.D} HH_L={home_home_last.L} HH_GF={home_home_last.GF} HH_GA={home_home_last.GA} HH_GD={hhgd} HH_PTS={hhp} HH_AVGGF={hhavg_gf} HH_AVGGA={hhavg_ga} HH_SEQ={home_home_last.seq} "
+        f"AA_FALLBACK={aa_fallback} AA_W={away_away_last.W} AA_D={away_away_last.D} AA_L={away_away_last.L} AA_GF={away_away_last.GF} AA_GA={away_away_last.GA} AA_GD={aagd} AA_PTS={aap} AA_AVGGF={aaavg_gf} AA_AVGGA={aaavg_ga} AA_SEQ={away_away_last.seq}"
     )
 
 
@@ -137,15 +159,6 @@ def build_example_text(
 # Data extraction
 # =========================
 def fetch_matches(conn: sqlite3.Connection) -> List[dict]:
-    """
-    Reads from Kaggle European Soccer Database (database.sqlite).
-    Pulls match rows with team/league names.
-
-    Uses Match table columns:
-      date, season, league_id, home_team_api_id, away_team_api_id,
-      home_team_goal, away_team_goal
-    plus Team/League names.
-    """
     q = """
     SELECT
         m.date as date,
@@ -171,17 +184,6 @@ def fetch_matches(conn: sqlite3.Connection) -> List[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
-def last_n_form(history: List[Tuple[str, int, int]]) -> TeamForm:
-    """
-    history: list of tuples (result_char, gf, ga) for that team in chronological order.
-    We take last N.
-    """
-    f = TeamForm()
-    for res, gf, ga in history[-LAST_N:]:
-        f.add(res, gf, ga)
-    return f.finalize()
-
-
 def main():
     random.seed(SEED)
 
@@ -192,16 +194,25 @@ def main():
     matches = fetch_matches(conn)
     print(f"Loaded matches: {len(matches)}")
 
-    # Histories
-    # overall_history[team_id] -> list of (W/D/L, gf, ga)
     overall_history: Dict[int, List[Tuple[str, int, int]]] = {}
-    home_history: Dict[int, List[Tuple[str, int, int]]] = {}   # only matches when team played at home
-    away_history: Dict[int, List[Tuple[str, int, int]]] = {}   # only matches when team played away
+    home_history: Dict[int, List[Tuple[str, int, int]]] = {}
+    away_history: Dict[int, List[Tuple[str, int, int]]] = {}
 
-    # ELO per team (global). You can also reset per season/league, but global works fine & simple.
     elo: Dict[int, float] = {}
 
     examples = []
+
+    # feature_names (stabilno, uvek isti redosled)
+    form_names = ["W", "D", "L", "GF", "GA", "GD", "PTS", "AvgGF", "AvgGA"]
+    feature_names = (
+        ["home_elo", "away_elo", "elo_diff"]
+        + [f"home_last_{n}" for n in form_names]
+        + [f"away_last_{n}" for n in form_names]
+        + ["hh_fallback"]
+        + [f"home_home_last_{n}" for n in form_names]
+        + ["aa_fallback"]
+        + [f"away_away_last_{n}" for n in form_names]
+    )
 
     for m in matches:
         date = (m["date"] or "")[:10]
@@ -215,56 +226,75 @@ def main():
         hg = int(m["home_goals"])
         ag = int(m["away_goals"])
 
-        # Need at least LAST_N previous matches in overall history for both teams
         h_hist = overall_history.get(home_id, [])
         a_hist = overall_history.get(away_id, [])
-        if len(h_hist) < LAST_N or len(a_hist) < LAST_N:
-            # Update histories & elo anyway, then continue
-            # (no leakage: this match updates after)
-            pass
-        else:
-            # home-only and away-only forms (fallback to overall if insufficient)
+
+        if len(h_hist) >= LAST_N and len(a_hist) >= LAST_N:
             hh_hist = home_history.get(home_id, [])
             aa_hist = away_history.get(away_id, [])
 
             home_last = last_n_form(h_hist)
             away_last = last_n_form(a_hist)
 
+            hh_fallback = 0
+            aa_fallback = 0
+
             if len(hh_hist) >= LAST_N:
                 home_home_last = last_n_form(hh_hist)
             else:
-                home_home_last = home_last  # fallback
+                home_home_last = home_last
+                hh_fallback = 1
 
             if len(aa_hist) >= LAST_N:
                 away_away_last = last_n_form(aa_hist)
             else:
-                away_away_last = away_last  # fallback
+                away_away_last = away_last
+                aa_fallback = 1
 
             # Elo BEFORE match (no leakage)
-            home_elo = elo.get(home_id, ELO_BASE)
-            away_elo = elo.get(away_id, ELO_BASE)
+            home_elo = float(elo.get(home_id, ELO_BASE))
+            away_elo = float(elo.get(away_id, ELO_BASE))
+            elo_diff = home_elo - away_elo
 
-            text = build_example_text(
+            # Compact text (for Transformer)
+            text = build_compact_text(
                 league_name=league_name,
                 season=season,
                 home_team=home_team,
                 away_team=away_team,
+                home_elo=home_elo,
+                away_elo=away_elo,
                 home_last=home_last,
                 away_last=away_last,
                 home_home_last=home_home_last,
                 away_away_last=away_away_last,
-                home_elo=home_elo,
-                away_elo=away_elo,
+                hh_fallback=hh_fallback,
+                aa_fallback=aa_fallback,
+            )
+
+            # Numeric features (for MLP)
+            features = (
+                [home_elo, away_elo, elo_diff]
+                + form_to_features(home_last)
+                + form_to_features(away_last)
+                + [float(hh_fallback)]
+                + form_to_features(home_home_last)
+                + [float(aa_fallback)]
+                + form_to_features(away_away_last)
             )
 
             label = outcome_label(hg, ag)
 
             examples.append(
-                {"date": date, "text": text, "label": label}
+                {
+                    "date": date,
+                    "text": text,
+                    "features": features,
+                    "label": label,
+                }
             )
 
-        # Now update histories with this match result
-        # Home team perspective
+        # update histories after using this match
         if hg > ag:
             h_res, a_res = "W", "L"
         elif hg == ag:
@@ -279,15 +309,14 @@ def main():
         away_history.setdefault(away_id, []).append((a_res, ag, hg))
 
         # Update ELO after match
-        h_rating = elo.get(home_id, ELO_BASE)
-        a_rating = elo.get(away_id, ELO_BASE)
+        h_rating = float(elo.get(home_id, ELO_BASE))
+        a_rating = float(elo.get(away_id, ELO_BASE))
         new_h, new_a = update_elo(h_rating, a_rating, hg, ag)
         elo[home_id] = new_h
         elo[away_id] = new_a
 
     print(f"Built examples: {len(examples)}")
 
-    # Sort by date to avoid leakage (realistic evaluation)
     examples.sort(key=lambda x: x["date"])
 
     n = len(examples)
@@ -301,7 +330,7 @@ def main():
     def dist(data):
         d = {0: 0, 1: 0, 2: 0}
         for x in data:
-            d[x["label"]] += 1
+            d[int(x["label"])] += 1
         return d
 
     print("Split:", len(train_data), len(val_data), len(test_data))
@@ -318,7 +347,17 @@ def main():
     write_jsonl(OUT_DIR / "val.jsonl", val_data)
     write_jsonl(OUT_DIR / "test.jsonl", test_data)
 
+    meta = {
+        "last_n": LAST_N,
+        "num_features": len(feature_names),
+        "feature_names": feature_names,
+        "elo": {"base": ELO_BASE, "k": ELO_K, "home_adv": ELO_HOME_ADV},
+        "splits": {"train_ratio": TRAIN_RATIO, "val_ratio": VAL_RATIO, "test_ratio": 1.0 - TRAIN_RATIO - VAL_RATIO},
+    }
+    (OUT_DIR / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
     print("Done -> data_out/train.jsonl, val.jsonl, test.jsonl")
+    print("Meta -> data_out/meta.json")
 
 
 if __name__ == "__main__":

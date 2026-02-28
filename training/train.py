@@ -7,19 +7,13 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import get_config, get_model_path
-from models.football_model import FootballTransformerClassifier
+from models.football_model import HybridFootballTransformerClassifier
 from training.dataset import FootballDataset
+from training.metrics import evaluate, pred_distribution, make_reports
 
 
 def set_seed(seed: int):
@@ -38,18 +32,11 @@ def get_device():
 
 
 def compute_class_weights(train_dataset, num_classes: int, device: torch.device):
-    """
-    Robust class weights:
-    - If some class has 0 samples, weight is set to 0 (so it doesn't explode to inf).
-    - Also prints counts so you can verify.
-    """
     counts = torch.zeros(num_classes, dtype=torch.float)
     for s in train_dataset.samples:
         y = int(s["label"])
         if y < 0 or y >= num_classes:
-            raise ValueError(
-                f"Found label={y} but num_classes={num_classes}. Fix config or data."
-            )
+            raise ValueError(f"Found label={y} but num_classes={num_classes}. Fix config or data.")
         counts[y] += 1
 
     total = counts.sum().item()
@@ -57,48 +44,41 @@ def compute_class_weights(train_dataset, num_classes: int, device: torch.device)
         raise ValueError("Training set is empty (0 samples).")
 
     weights = torch.zeros_like(counts)
-
-    # Standard inverse-frequency weights for classes that exist
     for i in range(num_classes):
         if counts[i] > 0:
             weights[i] = counts.sum() / (num_classes * counts[i])
         else:
-            weights[i] = 0.0  # IMPORTANT: avoid inf
+            weights[i] = 0.0
 
     return counts.to(device), weights.to(device)
 
 
-@torch.no_grad()
-def evaluate(model, dataloader, device):
-    model.eval()
-    all_preds, all_labels = [], []
-
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["label"].to(device)
-
-        logits = model(input_ids, attention_mask)
-        preds = torch.argmax(logits, dim=1)
-
-        all_preds.extend(preds.cpu().numpy().tolist())
-        all_labels.extend(labels.cpu().numpy().tolist())
-
-    return {
-        "accuracy": accuracy_score(all_labels, all_preds),
-        "balanced_accuracy": balanced_accuracy_score(all_labels, all_preds),
-        "macro_f1": f1_score(all_labels, all_preds, average="macro"),
-        "weighted_f1": f1_score(all_labels, all_preds, average="weighted"),
-        "all_labels": all_labels,
-        "all_preds": all_preds,
-    }
+def compute_feature_stats(train_dataset: FootballDataset):
+    feats = torch.stack(
+        [torch.tensor(s["features"], dtype=torch.float32) for s in train_dataset.samples],
+        dim=0
+    )  # [N,F]
+    mean = feats.mean(dim=0)
+    std = feats.std(dim=0, unbiased=False).clamp(min=1e-6)
+    return mean, std
 
 
-def pred_distribution(preds: list[int]) -> dict[int, int]:
-    d: dict[int, int] = {}
-    for p in preds:
-        d[p] = d.get(p, 0) + 1
-    return dict(sorted(d.items(), key=lambda kv: kv[0]))
+def warmup_cosine_scheduler(optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.1):
+    """
+    LR schedule:
+      - linear warmup to base LR
+      - cosine decay to base_lr * min_lr_ratio
+    """
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return float(step) / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def train():
@@ -114,6 +94,7 @@ def train():
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     metrics_csv = logs_dir / "metrics.csv"
     test_report_txt = logs_dir / f"test_report_{run_id}.txt"
+    feat_stats_path = Path(config.get("feature_stats_path", "data_out/feature_stats.json"))
 
     train_dataset = FootballDataset(
         json_path=config["train_path"],
@@ -131,6 +112,25 @@ def train():
         context_size=config["context_size"],
     )
 
+    # --- feature normalization (train stats)
+    feat_mean, feat_std = compute_feature_stats(train_dataset)
+    train_dataset.set_feature_normalizer(feat_mean, feat_std)
+    val_dataset.set_feature_normalizer(feat_mean, feat_std)
+    test_dataset.set_feature_normalizer(feat_mean, feat_std)
+
+    feat_stats_path.write_text(
+        json.dumps(
+            {
+                "num_features": int(train_dataset.num_features),
+                "mean": feat_mean.tolist(),
+                "std": feat_std.tolist(),
+            },
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+    print("Saved feature stats ->", feat_stats_path)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
@@ -142,22 +142,24 @@ def train():
 
     vocab_size = train_dataset.tokenizer.get_vocab_size()
 
-    # ---- Sanity check: labels must be within [0, num_classes-1]
+    # Sanity: labels range
     max_label = max(int(s["label"]) for s in train_dataset.samples)
     if max_label >= config["num_classes"]:
         raise ValueError(
             f"Config num_classes={config['num_classes']} but found label={max_label} in train set."
         )
 
-    model = FootballTransformerClassifier(
+    model = HybridFootballTransformerClassifier(
         vocab_size=vocab_size,
         context_size=config["context_size"],
         model_dimension=config["model_dimension"],
         num_classes=config["num_classes"],
+        num_features=train_dataset.num_features,
         num_blocks=config["num_blocks"],
         heads=config["heads"],
         ff_multiplier=config["ff_multiplier"],
         dropout=config["dropout"],
+        feature_hidden=config.get("feature_hidden", 128),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -175,12 +177,17 @@ def train():
         label_smoothing=float(config.get("label_smoothing", 0.0)),
     )
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=2
+    total_steps = config["num_epochs"] * max(1, len(train_loader))
+    warmup_steps = int(total_steps * float(config.get("warmup_ratio", 0.06)))
+    scheduler = warmup_cosine_scheduler(
+        optimizer,
+        warmup_steps=warmup_steps,
+        total_steps=total_steps,
+        min_lr_ratio=float(config.get("min_lr_ratio", 0.15)),
     )
 
     best_macro_f1 = -1.0
-    patience = 6
+    patience = int(config.get("patience", 6))
     early_counter = 0
 
     header = [
@@ -194,11 +201,12 @@ def train():
         "lr",
     ]
 
-    # Ensure CSV has header
     write_header = not metrics_csv.exists()
     if write_header:
         with metrics_csv.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(header)
+
+    global_step = 0
 
     for epoch in range(config["num_epochs"]):
         model.train()
@@ -208,40 +216,39 @@ def train():
         for batch in loop:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            features = batch["features"].to(device)
             labels = batch["label"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            logits = model(input_ids, attention_mask)
+            logits = model(input_ids, attention_mask, features)
             loss = criterion(logits, labels)
 
-            # If NaN happens, stop immediately with clear error
             if torch.isnan(loss):
-                raise RuntimeError(
-                    "Loss became NaN. Check class weights / num_classes / inputs."
-                )
+                raise RuntimeError("Loss became NaN. Check data / features / weights / LR.")
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+            scheduler.step()
+            global_step += 1
 
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
 
         avg_loss = total_loss / max(1, len(train_loader))
 
-        val_metrics = evaluate(model, val_loader, device)
-        scheduler.step(val_metrics["macro_f1"])
+        val_res = evaluate(model, val_loader, device)
         lr_now = optimizer.param_groups[0]["lr"]
-
-        pdist = pred_distribution(val_metrics["all_preds"])
+        pdist = pred_distribution(val_res.all_preds)
 
         print(f"\nEpoch {epoch+1}")
         print(f"Train Loss: {avg_loss:.4f}")
-        print(f"Val Accuracy: {val_metrics['accuracy']:.4f}")
-        print(f"Val Balanced Acc: {val_metrics['balanced_accuracy']:.4f}")
-        print(f"Val Macro F1: {val_metrics['macro_f1']:.4f}")
-        print(f"Val Weighted F1: {val_metrics['weighted_f1']:.4f}")
+        print(f"Val Accuracy: {val_res.accuracy:.4f}")
+        print(f"Val Balanced Acc: {val_res.balanced_accuracy:.4f}")
+        print(f"Val Macro F1: {val_res.macro_f1:.4f}")
+        print(f"Val Weighted F1: {val_res.weighted_f1:.4f}")
         print(f"Pred dist (val): {pdist}")
         print(f"LR: {lr_now:.6g}\n")
 
@@ -251,16 +258,16 @@ def train():
                     run_id,
                     epoch + 1,
                     round(avg_loss, 6),
-                    round(val_metrics["accuracy"], 6),
-                    round(val_metrics["balanced_accuracy"], 6),
-                    round(val_metrics["macro_f1"], 6),
-                    round(val_metrics["weighted_f1"], 6),
+                    round(val_res.accuracy, 6),
+                    round(val_res.balanced_accuracy, 6),
+                    round(val_res.macro_f1, 6),
+                    round(val_res.weighted_f1, 6),
                     lr_now,
                 ]
             )
 
-        if val_metrics["macro_f1"] > best_macro_f1:
-            best_macro_f1 = val_metrics["macro_f1"]
+        if val_res.macro_f1 > best_macro_f1:
+            best_macro_f1 = val_res.macro_f1
             early_counter = 0
             Path(config["model_folder"]).mkdir(exist_ok=True)
             torch.save(model.state_dict(), get_model_path(config))
@@ -281,24 +288,17 @@ def train():
         print("WARNING: No checkpoint found, evaluating current model.")
 
     print("Evaluating on test set...")
-    test_metrics = evaluate(model, test_loader, device)
+    test_res = evaluate(model, test_loader, device)
 
-    cm = confusion_matrix(test_metrics["all_labels"], test_metrics["all_preds"])
-    report = classification_report(
-        test_metrics["all_labels"],
-        test_metrics["all_preds"],
-        target_names=["HOME_WIN", "DRAW", "AWAY_WIN"],
-        digits=4,
-        zero_division=0,
-    )
+    print("Test Accuracy:", round(test_res.accuracy, 4))
+    print("Test Macro F1:", round(test_res.macro_f1, 4))
 
-    print("Test Accuracy:", round(test_metrics["accuracy"], 4))
-    print("Test Macro F1:", round(test_metrics["macro_f1"], 4))
-    print("\nConfusion matrix:\n", cm)
-    print("\nClassification report:\n", report)
+    reports = make_reports(test_res.all_labels, test_res.all_preds)
+    print("\nConfusion matrix:\n", reports["confusion_matrix"])
+    print("\nClassification report:\n", reports["classification_report"])
 
     with test_report_txt.open("w", encoding="utf-8") as f:
-        f.write(report)
+        f.write(reports["classification_report"])
 
     print(f"\nSaved metrics CSV -> {metrics_csv}")
     print(f"Saved test report -> {test_report_txt}")
