@@ -1,5 +1,4 @@
 import json
-import math
 import random
 import sqlite3
 from dataclasses import dataclass
@@ -94,8 +93,8 @@ class TeamForm:
     def extra_stats(self) -> Tuple[int, int, float, float]:
         pts = self.W * 3 + self.D
         gd = self.GF - self.GA
-        avg_gf = round(safe_div(self.GF, LAST_N), 3)
-        avg_ga = round(safe_div(self.GA, LAST_N), 3)
+        avg_gf = safe_div(self.GF, LAST_N)
+        avg_ga = safe_div(self.GA, LAST_N)
         return pts, gd, avg_gf, avg_ga
 
 
@@ -147,17 +146,19 @@ def build_compact_text(
     return (
         f"LEAGUE={league_name} SEASON={season} "
         f"HOME={home_team} AWAY={away_team} "
-        f"HELO={round(home_elo,1)} AELO={round(away_elo,1)} "
-        f"H_W={home_last.W} H_D={home_last.D} H_L={home_last.L} H_GF={home_last.GF} H_GA={home_last.GA} H_GD={hgd} H_PTS={hp} H_AVGGF={havg_gf} H_AVGGA={havg_ga} H_SEQ={home_last.seq} "
-        f"A_W={away_last.W} A_D={away_last.D} A_L={away_last.L} A_GF={away_last.GF} A_GA={away_last.GA} A_GD={agd} A_PTS={ap} A_AVGGF={aavg_gf} A_AVGGA={aavg_ga} A_SEQ={away_last.seq} "
-        f"HH_FALLBACK={hh_fallback} HH_W={home_home_last.W} HH_D={home_home_last.D} HH_L={home_home_last.L} HH_GF={home_home_last.GF} HH_GA={home_home_last.GA} HH_GD={hhgd} HH_PTS={hhp} HH_AVGGF={hhavg_gf} HH_AVGGA={hhavg_ga} HH_SEQ={home_home_last.seq} "
-        f"AA_FALLBACK={aa_fallback} AA_W={away_away_last.W} AA_D={away_away_last.D} AA_L={away_away_last.L} AA_GF={away_away_last.GF} AA_GA={away_away_last.GA} AA_GD={aagd} AA_PTS={aap} AA_AVGGF={aaavg_gf} AA_AVGGA={aaavg_ga} AA_SEQ={away_away_last.seq}"
+        f"HELO={home_elo:.1f} AELO={away_elo:.1f} "
+        f"H_W={home_last.W} H_D={home_last.D} H_L={home_last.L} H_GF={home_last.GF} H_GA={home_last.GA} H_GD={hgd} H_PTS={hp} H_AVGGF={havg_gf:.3f} H_AVGGA={havg_ga:.3f} H_SEQ={home_last.seq} "
+        f"A_W={away_last.W} A_D={away_last.D} A_L={away_last.L} A_GF={away_last.GF} A_GA={away_last.GA} A_GD={agd} A_PTS={ap} A_AVGGF={aavg_gf:.3f} A_AVGGA={aavg_ga:.3f} A_SEQ={away_last.seq} "
+        f"HH_FALLBACK={hh_fallback} HH_W={home_home_last.W} HH_D={home_home_last.D} HH_L={home_home_last.L} HH_GF={home_home_last.GF} HH_GA={home_home_last.GA} HH_GD={hhgd} HH_PTS={hhp} HH_AVGGF={hhavg_gf:.3f} HH_AVGGA={hhavg_ga:.3f} HH_SEQ={home_home_last.seq} "
+        f"AA_FALLBACK={aa_fallback} AA_W={away_away_last.W} AA_D={away_away_last.D} AA_L={away_away_last.L} AA_GF={away_away_last.GF} AA_GA={away_away_last.GA} AA_GD={aagd} AA_PTS={aap} AA_AVGGF={aaavg_gf:.3f} AA_AVGGA={aaavg_ga:.3f} AA_SEQ={away_away_last.seq}"
     )
 
 
-# =========================
-# Data extraction
-# =========================
+def pts_rate(pts: int) -> float:
+    # normalize points in last N games to [0,1]
+    return safe_div(float(pts), float(3 * LAST_N))
+
+
 def fetch_matches(conn: sqlite3.Connection) -> List[dict]:
     q = """
     SELECT
@@ -202,9 +203,10 @@ def main():
 
     examples = []
 
-    # feature_names (stabilno, uvek isti redosled)
+    # ---- feature names (stable ordering)
     form_names = ["W", "D", "L", "GF", "GA", "GD", "PTS", "AvgGF", "AvgGA"]
-    feature_names = (
+
+    base_feature_names = (
         ["home_elo", "away_elo", "elo_diff"]
         + [f"home_last_{n}" for n in form_names]
         + [f"away_last_{n}" for n in form_names]
@@ -213,6 +215,41 @@ def main():
         + ["aa_fallback"]
         + [f"away_away_last_{n}" for n in form_names]
     )
+
+    # ---- new engineered features (differences, abs differences, interactions)
+    engineered_feature_names = [
+        "abs_elo_diff",
+        "home_pts_rate",
+        "away_pts_rate",
+        "pts_diff",
+        "abs_pts_diff",
+        "gd_diff",
+        "abs_gd_diff",
+        "avg_gf_diff",
+        "abs_avg_gf_diff",
+        "avg_ga_diff",
+        "abs_avg_ga_diff",
+        "total_avg_goals",
+        "total_avg_conceded",
+        "home_attack_minus_away_def",
+        "away_attack_minus_home_def",
+        "hh_pts_rate",
+        "aa_pts_rate",
+        "hh_pts_rate_diff",
+        "abs_hh_pts_rate_diff",
+        "hh_gd_diff",
+        "abs_hh_gd_diff",
+        "hh_avg_gf_diff",
+        "abs_hh_avg_gf_diff",
+        "hh_avg_ga_diff",
+        "abs_hh_avg_ga_diff",
+        "hh_total_avg_goals",
+        "hh_total_avg_conceded",
+        "hh_attack_minus_aa_def",
+        "aa_attack_minus_hh_def",
+    ]
+
+    feature_names = base_feature_names + engineered_feature_names
 
     for m in matches:
         date = (m["date"] or "")[:10]
@@ -255,8 +292,45 @@ def main():
             home_elo = float(elo.get(home_id, ELO_BASE))
             away_elo = float(elo.get(away_id, ELO_BASE))
             elo_diff = home_elo - away_elo
+            abs_elo_diff = abs(elo_diff)
 
-            # Compact text (for Transformer)
+            # Stats (overall)
+            h_pts, h_gd, h_avg_gf, h_avg_ga = home_last.extra_stats()
+            a_pts, a_gd, a_avg_gf, a_avg_ga = away_last.extra_stats()
+
+            home_pts_rate = pts_rate(h_pts)
+            away_pts_rate = pts_rate(a_pts)
+
+            pts_diff = float(h_pts - a_pts)
+            gd_diff = float(h_gd - a_gd)
+            avg_gf_diff = float(h_avg_gf - a_avg_gf)
+            avg_ga_diff = float(h_avg_ga - a_avg_ga)
+
+            total_avg_goals = float(h_avg_gf + a_avg_gf)
+            total_avg_conceded = float(h_avg_ga + a_avg_ga)
+
+            home_attack_minus_away_def = float(h_avg_gf - a_avg_ga)
+            away_attack_minus_home_def = float(a_avg_gf - h_avg_ga)
+
+            # Stats (venue-specific)
+            hh_pts, hh_gd, hh_avg_gf, hh_avg_ga = home_home_last.extra_stats()
+            aa_pts, aa_gd, aa_avg_gf, aa_avg_ga = away_away_last.extra_stats()
+
+            hh_pts_rate = pts_rate(hh_pts)
+            aa_pts_rate = pts_rate(aa_pts)
+
+            hh_pts_rate_diff = float(hh_pts_rate - aa_pts_rate)
+            hh_gd_diff = float(hh_gd - aa_gd)
+            hh_avg_gf_diff = float(hh_avg_gf - aa_avg_gf)
+            hh_avg_ga_diff = float(hh_avg_ga - aa_avg_ga)
+
+            hh_total_avg_goals = float(hh_avg_gf + aa_avg_gf)
+            hh_total_avg_conceded = float(hh_avg_ga + aa_avg_ga)
+
+            hh_attack_minus_aa_def = float(hh_avg_gf - aa_avg_ga)
+            aa_attack_minus_hh_def = float(aa_avg_gf - hh_avg_ga)
+
+            # Text for Transformer
             text = build_compact_text(
                 league_name=league_name,
                 season=season,
@@ -272,7 +346,7 @@ def main():
                 aa_fallback=aa_fallback,
             )
 
-            # Numeric features (for MLP)
+            # Base numeric features (same as before)
             features = (
                 [home_elo, away_elo, elo_diff]
                 + form_to_features(home_last)
@@ -283,15 +357,43 @@ def main():
                 + form_to_features(away_away_last)
             )
 
+            # Engineered numeric features (appended, stable order)
+            features += [
+                float(abs_elo_diff),
+                float(home_pts_rate),
+                float(away_pts_rate),
+                float(pts_diff),
+                float(abs(pts_diff)),
+                float(gd_diff),
+                float(abs(gd_diff)),
+                float(avg_gf_diff),
+                float(abs(avg_gf_diff)),
+                float(avg_ga_diff),
+                float(abs(avg_ga_diff)),
+                float(total_avg_goals),
+                float(total_avg_conceded),
+                float(home_attack_minus_away_def),
+                float(away_attack_minus_home_def),
+                float(hh_pts_rate),
+                float(aa_pts_rate),
+                float(hh_pts_rate_diff),
+                float(abs(hh_pts_rate_diff)),
+                float(hh_gd_diff),
+                float(abs(hh_gd_diff)),
+                float(hh_avg_gf_diff),
+                float(abs(hh_avg_gf_diff)),
+                float(hh_avg_ga_diff),
+                float(abs(hh_avg_ga_diff)),
+                float(hh_total_avg_goals),
+                float(hh_total_avg_conceded),
+                float(hh_attack_minus_aa_def),
+                float(aa_attack_minus_hh_def),
+            ]
+
             label = outcome_label(hg, ag)
 
             examples.append(
-                {
-                    "date": date,
-                    "text": text,
-                    "features": features,
-                    "label": label,
-                }
+                {"date": date, "text": text, "features": features, "label": label}
             )
 
         # update histories after using this match
@@ -352,12 +454,17 @@ def main():
         "num_features": len(feature_names),
         "feature_names": feature_names,
         "elo": {"base": ELO_BASE, "k": ELO_K, "home_adv": ELO_HOME_ADV},
-        "splits": {"train_ratio": TRAIN_RATIO, "val_ratio": VAL_RATIO, "test_ratio": 1.0 - TRAIN_RATIO - VAL_RATIO},
+        "splits": {
+            "train_ratio": TRAIN_RATIO,
+            "val_ratio": VAL_RATIO,
+            "test_ratio": 1.0 - TRAIN_RATIO - VAL_RATIO,
+        },
     }
     (OUT_DIR / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("Done -> data_out/train.jsonl, val.jsonl, test.jsonl")
     print("Meta -> data_out/meta.json")
+    print("New num_features:", meta["num_features"])
 
 
 if __name__ == "__main__":

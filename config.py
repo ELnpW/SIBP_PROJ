@@ -5,9 +5,9 @@ def get_config():
     return {
         # Training
         "batch_size": 64,
-        "num_epochs": 25,
-        "learning_rate": 3e-4,
-        "weight_decay": 1e-4,
+        "num_epochs": 15,
+        "learning_rate": 2e-4,
+        "weight_decay": 2e-4,
         "seed": 561,
 
         # Model / data
@@ -16,12 +16,12 @@ def get_config():
         "num_blocks": 6,
         "heads": 6,
         "ff_multiplier": 4,
-        "dropout": 0.15,
+        "dropout": 0.12,
         "feature_hidden": 128,
         "num_classes": 3,
 
         # Loss
-        "label_smoothing": 0.02,
+        "label_smoothing": 0.04,
 
         # LR schedule
         "warmup_ratio": 0.06,
